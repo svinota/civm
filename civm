@@ -1,0 +1,167 @@
+#!/bin/bash
+
+# make it configurable?
+maxwid=3
+workdir=$1
+rundir="/var/run/civm"
+run=$2
+
+[ -z "$workdir" ] && workdir="."
+[ -z "$run" ] && run="`echo $workdir/configs/*xml`"
+[ -d "$rundir/lock" -a -d "$rundir/pool" -a -d "$rundir/mnt" ] || {
+    mkdir -p "$rundir/lock"
+    mkdir -p "$rundir/pool"
+    mkdir -p "$rundir/mnt"
+}
+
+
+# log string with date, worker id and VM name
+function log() {
+    echo -e "`date +%H:%M:%S` [worker-$wid] $name : $1"
+}
+
+# workaround for some umount issues
+function safe_umount() {
+    local interval
+    interval=0
+    while :; do {
+        interval=$(( $interval + 1 ))
+        [ $interval -gt 10 ] && interval=10
+        umount $1 >/dev/null 2>&1 && break
+        # fail, find the reason
+        reason=`umount $1 2>&1`
+        # unmounted (that happens)
+        echo $reason | grep "not mounted" >/dev/null && break
+        # log and sleep
+        log "can not umount $1: $reason"
+        log "`fuser -m $1`"
+        sleep $interval
+    } done
+}
+
+# the worker code -- runs async
+function worker() {
+    local wid
+    local config
+    local name
+    local img
+
+    wid=$1
+    config=$2
+    name=$3
+    img=$4
+
+    # allocate worker lock
+    mv $rundir/pool/$wid $rundir/lock/
+    log "started"
+    qemu-img snapshot -a init $img
+    qemu-nbd -c /dev/nbd$wid $img
+    while :; do {
+        [ -e /dev/nbd$wid\p1 ] && break
+        sleep 1
+    } done
+    mkdir -p $rundir/mnt/$wid
+    mount /dev/nbd$wid\p1 $rundir/mnt/$wid
+    export CIVM_WORKER_MOUNT=$rundir/mnt/$wid
+    export CIVM_WORKER_NAME=$name
+    export CIVM_WORKER_WORKDIR=$workdir
+    $workdir/pre.sh
+    log "pre.sh finished, starting sync"
+    sync
+    safe_umount $rundir/mnt/$wid
+    rmdir $rundir/mnt/$wid
+    qemu-nbd -d /dev/nbd$wid >/dev/null
+    log "sync done, starting VM"
+    virsh create $config >/dev/null
+    while :; do {
+        virsh list | grep $name >/dev/null 2>&1 || break
+        sleep 2
+    } done
+    log "VM down, running post.sh"
+    qemu-nbd -c /dev/nbd$wid $img
+    while :; do {
+        [ -e /dev/nbd$wid\p1 ] && break
+        sleep 1
+    } done
+    mkdir -p $rundir/mnt/$wid
+    mount /dev/nbd$wid\p1 $rundir/mnt/$wid
+    $workdir/post.sh
+    sync
+    safe_umount $rundir/mnt/$wid
+    rmdir $rundir/mnt/$wid
+    qemu-nbd -d /dev/nbd$wid >/dev/null
+    log "job done"
+    mv $rundir/lock/$wid $rundir/pool/
+}
+
+
+# check for deps
+modprobe -r nbd
+modprobe nbd max_part=5
+lsmod | grep nbd >/dev/null 2>&1 || { echo "nbd not loaded"; exit 255; }
+for app in qemu-img qemu-nbd fuser git virsh dirname basename wget; do {
+    which $app >/dev/null 2>&1 || { echo "$app not found"; exit 255; }
+} done
+
+
+# check images
+for config in $run; do {
+    img=`awk -F \' '/file.*qcow2/ {print $2}' $config`
+    name=`sed -n '/name/ {s/[^>]*>//;s/<.*//p;q}' $config`
+    [ -e "$img" ] || {
+        # image doesn't exist, download it?
+        echo "Disk image doesn't exist. Press Return to download"
+        url=`awk "/^$name/ {print \\$3}" urls`
+        md5=`awk "/^$name/ {print \\$2}" urls`
+        echo $url
+        read
+        pushd `dirname $img` >/dev/null
+            wget $url || exit 255
+            echo -n "`date +%H:%M:%S` Check md5 sum ... "
+            echo "$md5 `basename $img`" | md5sum -c - >/dev/null 2>&1 || {
+                echo "failed"
+                exit 255
+            }
+            echo "done"
+        popd >/dev/null
+    }
+} done
+
+# create worker locks
+for wid in `seq 0 $maxwid`; do {
+    rm -f $rundir/lock/$wid
+    touch $rundir/pool/$wid
+} done
+
+# start workers
+wid=0
+while :; do {
+    wid=$(( $wid + 1 ))
+    if [ $wid -gt $maxwid ]; then {
+        wid=0
+        wait -n
+    } else {
+        [ -e $rundir/lock/$wid ] && continue
+        # get next config
+        spt=`echo $run | sed 's/\ /:/'`
+        [ -z "$spt" ] && {
+            config=$run
+            run=""
+        } || {
+            config=`echo $spt | awk -F \: '{print $1}'`
+            run=`echo $spt | awk -F \: '{print $2}'`
+        }
+        img=`awk -F \' '/file.*qcow2/ {print $2}' $config`
+        name=`sed -n '/name/ {s/[^>]*>//;s/<.*//p;q}' $config`
+        worker $wid $config $name $img &
+        [ -z "$run" ] && break
+    } fi
+} done
+
+sleep 1
+wait
+
+# cleanup worker locks
+for wid in `seq 0 $maxwid`; do {
+    rm -f $rundir/pool/$wid
+} done
