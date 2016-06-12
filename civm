@@ -111,8 +111,8 @@ for config in $run; do {
     [ -e "$img" ] || {
         # image doesn't exist, download it?
         echo "Disk image doesn't exist. Press Return to download"
-        url=`awk "/^$name/ {print \\$3}" urls`
-        md5=`awk "/^$name/ {print \\$2}" urls`
+        url=`awk "/^$name/ {print \\$3}" $workdir/urls`
+        md5=`awk "/^$name/ {print \\$2}" $workdir/urls`
         echo $url
         read
         pushd `dirname $img` >/dev/null
